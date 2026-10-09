@@ -1,0 +1,12 @@
+# Секреты и данные — никогда не коммитить
+.env
+data/
+*.session
+*.session-journal
+*.db
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

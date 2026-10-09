@@ -1,0 +1,12 @@
+services:
+  tgmanager:
+    build: .
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    # нужно для первого входа: docker compose run --rm tgmanager login
+    stdin_open: true
+    tty: true
