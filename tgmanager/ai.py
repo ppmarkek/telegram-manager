@@ -1,14 +1,16 @@
-"""Всё общение с Claude: раскладка по папкам, поиск задач, сводка и чат-помощник."""
+"""Общение с ИИ: раскладка по папкам, поиск задач, сводка и чат-помощник.
+
+Бэкенды: Claude API (здесь) и Antigravity CLI `agy` (в agy.py)."""
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 import anthropic
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, model_validator
 
 log = logging.getLogger(__name__)
 
@@ -17,6 +19,7 @@ FALLBACK_BETA = "server-side-fallback-2026-07-01"
 FALLBACK_MODEL_PREFIXES = ("claude-opus-5", "claude-fable-5", "claude-sonnet-5-5")
 
 MAX_ASSISTANT_STEPS = 8
+DEFAULT_CLAUDE_MODEL = "claude-opus-5-5"
 
 
 class AIError(Exception):
@@ -41,6 +44,14 @@ class FoundTask(BaseModel):
     message: int
     title: str
     due: str | None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _due_may_be_missing(cls, data: Any) -> Any:
+        # Некоторые модели просто не присылают поле без срока.
+        if isinstance(data, dict):
+            return {"due": None, **data}
+        return data
 
 
 class FoundTasks(BaseModel):
@@ -104,7 +115,7 @@ ASSISTANT_SYSTEM = """\
 сам применить план ты не можешь;
 - присылать сводку непрочитанного и задач (send_digest);
 - искать сообщения в его чатах (search_messages);
-- менять настройки: часовой пояс и время утренней сводки (update_settings).
+- менять настройки: часовой пояс, время утренней сводки и модель ИИ (update_settings).
 
 Правила:
 - Отвечай по-русски, коротко и по делу. Обычный текст без Markdown-разметки.
@@ -179,6 +190,7 @@ ASSISTANT_TOOLS: list[dict[str, Any]] = [
         {
             "timezone": _nullable("string", "Часовой пояс IANA, например Europe/Moscow"),
             "digest_time": _nullable("string", "Время утренней сводки ЧЧ:ММ или off"),
+            "model": _nullable("string", "Модель ИИ: название или id из списка моделей"),
         },
     ),
 ]
@@ -186,54 +198,45 @@ ASSISTANT_TOOLS: list[dict[str, Any]] = [
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[str]]
 
 
+@dataclass(frozen=True)
+class ModelInfo:
+    id: str  # то, что передаётся в API / в agy --model
+    name: str  # человекочитаемое название
+
+
 class AI:
-    def __init__(self, model: str, client: anthropic.AsyncAnthropic | None = None):
-        self.model = model
-        self.client = client or anthropic.AsyncAnthropic()
+    """Общая часть: промпты и сценарии. Как именно звать модель — решают наследники."""
 
-    def _fallback_kwargs(self) -> dict[str, Any]:
-        if self.model.startswith(FALLBACK_MODEL_PREFIXES):
-            return {"betas": [FALLBACK_BETA], "fallbacks": "default"}
-        return {}
+    backend = "base"
+    backend_title = "ИИ"
 
-    @staticmethod
-    def _check_stop(response: Any) -> None:
-        if response.stop_reason == "refusal":
-            raise AIError("ИИ отказался обрабатывать этот запрос.")
-        if response.stop_reason == "max_tokens":
-            raise AIError("Ответ ИИ получился слишком длинным и оборвался.")
+    def __init__(self, model: str | None):
+        self.model = model or None
 
-    async def _parse(
+    # --- что реализуют бэкенды ---
+
+    async def _structured(
         self, system: str, user: str, schema: type[BaseModel], effort: str, max_tokens: int
     ) -> Any:
-        try:
-            response = await self.client.beta.messages.parse(
-                model=self.model,
-                max_tokens=max_tokens,
-                system=system,
-                messages=[{"role": "user", "content": user}],
-                output_format=schema,
-                output_config={"effort": effort},
-                **self._fallback_kwargs(),
-            )
-        except ValidationError as exc:
-            raise AIError("ИИ вернул ответ в неожиданном формате.") from exc
-        self._check_stop(response)
-        if response.parsed_output is None:
-            raise AIError("ИИ не вернул результат.")
-        return response.parsed_output
+        raise NotImplementedError
 
-    async def _text(self, system: str, user: str, effort: str, max_tokens: int = 16000) -> str:
-        response = await self.client.beta.messages.create(
-            model=self.model,
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-            output_config={"effort": effort},
-            **self._fallback_kwargs(),
-        )
-        self._check_stop(response)
-        return _joined_text(response.content)
+    async def _text(self, system: str, user: str, effort: str) -> str:
+        raise NotImplementedError
+
+    async def assistant(self, user_text: str, execute: ToolExecutor) -> str:
+        raise NotImplementedError
+
+    async def list_models(self) -> list[ModelInfo]:
+        raise NotImplementedError
+
+    async def version(self) -> str | None:
+        return None
+
+    async def update(self) -> str | None:
+        """Обновить сам инструмент (для agy). Возвращает вывод команды или None."""
+        return None
+
+    # --- сценарии ---
 
     async def plan_folders(
         self,
@@ -254,7 +257,7 @@ class AI:
         if wishes:
             parts.append("Пожелания пользователя:\n" + wishes)
         parts.append("Чаты:\n" + chats_text)
-        return await self._parse(
+        return await self._structured(
             FOLDERS_SYSTEM, "\n\n".join(parts), FolderPlan, effort="medium", max_tokens=32000
         )
 
@@ -264,7 +267,7 @@ class AI:
             f"Уже существующие задачи:\n{open_tasks or 'нет'}\n\n"
             f"Новые сообщения:\n{messages_text}"
         )
-        return await self._parse(TASKS_SYSTEM, user, FoundTasks, effort="low", max_tokens=16000)
+        return await self._structured(TASKS_SYSTEM, user, FoundTasks, effort="low", max_tokens=16000)
 
     async def digest(self, unread_text: str, tasks_text: str, now_text: str) -> str:
         user = (
@@ -273,6 +276,71 @@ class AI:
             f"Непрочитанное:\n{unread_text or 'нет'}"
         )
         return await self._text(DIGEST_SYSTEM, user, effort="low")
+
+
+class ClaudeAI(AI):
+    """Claude через официальный API (нужен ANTHROPIC_API_KEY)."""
+
+    backend = "claude"
+    backend_title = "Claude API"
+
+    def __init__(self, model: str | None, client: anthropic.AsyncAnthropic | None = None):
+        super().__init__(model or DEFAULT_CLAUDE_MODEL)
+        self.client = client or anthropic.AsyncAnthropic()
+
+    @property
+    def model_id(self) -> str:
+        return self.model or DEFAULT_CLAUDE_MODEL
+
+    def _fallback_kwargs(self) -> dict[str, Any]:
+        if self.model_id.startswith(FALLBACK_MODEL_PREFIXES):
+            return {"betas": [FALLBACK_BETA], "fallbacks": "default"}
+        return {}
+
+    @staticmethod
+    def _check_stop(response: Any) -> None:
+        if response.stop_reason == "refusal":
+            raise AIError("ИИ отказался обрабатывать этот запрос.")
+        if response.stop_reason == "max_tokens":
+            raise AIError("Ответ ИИ получился слишком длинным и оборвался.")
+
+    async def _structured(
+        self, system: str, user: str, schema: type[BaseModel], effort: str, max_tokens: int
+    ) -> Any:
+        try:
+            response = await self.client.beta.messages.parse(
+                model=self.model_id,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+                output_format=schema,
+                output_config={"effort": effort},
+                **self._fallback_kwargs(),
+            )
+        except ValidationError as exc:
+            raise AIError("ИИ вернул ответ в неожиданном формате.") from exc
+        self._check_stop(response)
+        if response.parsed_output is None:
+            raise AIError("ИИ не вернул результат.")
+        return response.parsed_output
+
+    async def _text(self, system: str, user: str, effort: str) -> str:
+        response = await self.client.beta.messages.create(
+            model=self.model_id,
+            max_tokens=16000,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+            output_config={"effort": effort},
+            **self._fallback_kwargs(),
+        )
+        self._check_stop(response)
+        return _joined_text(response.content)
+
+    async def list_models(self) -> list[ModelInfo]:
+        models = []
+        async for info in self.client.models.list(lifecycle=["active"]):
+            models.append(ModelInfo(id=info.id, name=info.display_name or info.id))
+        return models
 
     async def assistant(self, user_text: str, execute: ToolExecutor) -> str:
         """Один ход помощника: Claude может вызвать несколько инструментов подряд.
@@ -283,7 +351,7 @@ class AI:
         messages: list[dict[str, Any]] = [{"role": "user", "content": user_text}]
         for _ in range(MAX_ASSISTANT_STEPS):
             response = await self.client.beta.messages.create(
-                model=self.model,
+                model=self.model_id,
                 max_tokens=16000,
                 system=ASSISTANT_SYSTEM,
                 tools=ASSISTANT_TOOLS,
@@ -300,28 +368,23 @@ class AI:
             messages.append({"role": "assistant", "content": response.content})
             results = []
             for block in tool_uses:
-                try:
-                    output = await execute(block.name, dict(block.input))
-                    results.append(
-                        {"type": "tool_result", "tool_use_id": block.id, "content": output}
-                    )
-                except Exception as exc:  # ошибку инструмента показываем модели, а не роняем ход
-                    log.exception("Ошибка инструмента %s", block.name)
-                    results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": f"Ошибка: {exc}",
-                            "is_error": True,
-                        }
-                    )
+                output, is_error = await run_tool(execute, block.name, dict(block.input))
+                result = {"type": "tool_result", "tool_use_id": block.id, "content": output}
+                if is_error:
+                    result["is_error"] = True
+                results.append(result)
             messages.append({"role": "user", "content": results})
         return "Не получилось закончить за разумное число шагов — попробуй переформулировать."
 
 
+async def run_tool(execute: ToolExecutor, name: str, args: dict[str, Any]) -> tuple[str, bool]:
+    """Ошибку инструмента показываем модели, а не роняем весь ход."""
+    try:
+        return await execute(name, args), False
+    except Exception as exc:
+        log.exception("Ошибка инструмента %s", name)
+        return f"Ошибка: {exc}", True
+
+
 def _joined_text(content: list[Any]) -> str:
     return "\n".join(b.text for b in content if b.type == "text").strip()
-
-
-def dumps(data: Any) -> str:
-    return json.dumps(data, ensure_ascii=False)

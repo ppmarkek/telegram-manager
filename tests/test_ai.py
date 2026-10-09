@@ -7,7 +7,7 @@ import anthropic
 import httpx2
 import pytest
 
-from tgmanager.ai import AI, ASSISTANT_TOOLS, AIError, FALLBACK_BETA
+from tgmanager.ai import ASSISTANT_TOOLS, AIError, ClaudeAI, FALLBACK_BETA
 
 
 def message(content, stop_reason="end_turn"):
@@ -27,7 +27,8 @@ def make_ai(responses, model="claude-opus-5-5"):
     requests = []
 
     def handler(request):
-        requests.append({"headers": request.headers, "body": json.loads(request.content)})
+        body = json.loads(request.content) if request.content else None
+        requests.append({"headers": request.headers, "body": body, "url": str(request.url)})
         return httpx2.Response(200, json=responses.pop(0))
 
     client = anthropic.AsyncAnthropic(
@@ -35,7 +36,7 @@ def make_ai(responses, model="claude-opus-5-5"):
         http_client=anthropic.DefaultAsyncHttpxClient(transport=httpx2.MockTransport(handler)),
         max_retries=0,
     )
-    return AI(model, client), requests
+    return ClaudeAI(model, client), requests
 
 
 def test_extract_tasks_request_and_parse():
@@ -130,3 +131,28 @@ def test_tool_schemas_are_strict():
         assert tool["strict"] is True
         assert schema["additionalProperties"] is False
         assert sorted(schema["required"]) == sorted(schema["properties"])
+
+
+def test_list_models_uses_models_api():
+    page = {
+        "data": [
+            {"type": "model", "id": "claude-opus-5-5", "display_name": "Claude Opus 5.5", "created_at": "2026-09-01T00:00:00Z"},
+            {"type": "model", "id": "claude-haiku-5-5", "display_name": "Claude Haiku 5.5", "created_at": "2026-09-01T00:00:00Z"},
+        ],
+        "has_more": False,
+        "first_id": "claude-opus-5-5",
+        "last_id": "claude-haiku-5-5",
+    }
+    ai, requests = make_ai([page])
+    models = asyncio.run(ai.list_models())
+    assert "/v1/models" in requests[0]["url"] and "lifecycle" in requests[0]["url"]
+    assert [(m.id, m.name) for m in models] == [
+        ("claude-opus-5-5", "Claude Opus 5.5"),
+        ("claude-haiku-5-5", "Claude Haiku 5.5"),
+    ]
+
+
+def test_claude_default_model_when_none():
+    ai, requests = make_ai([message([{"type": "text", "text": "ok"}])], model=None)
+    asyncio.run(ai.digest("", "", "сейчас"))
+    assert requests[0]["body"]["model"] == "claude-opus-5-5"

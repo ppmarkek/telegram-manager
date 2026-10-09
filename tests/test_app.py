@@ -8,8 +8,8 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from tgmanager import app as app_module
-from tgmanager.ai import FoundTask, FoundTasks
-from tgmanager.app import App, parse_callback, split_text
+from tgmanager.ai import FoundTask, FoundTasks, ModelInfo
+from tgmanager.app import App, parse_callback, resolve_model, split_text
 from tgmanager.config import Settings
 
 TZ = "Europe/Moscow"
@@ -22,7 +22,13 @@ def make_settings(tmp_path: Path) -> Settings:
         bot_token="token",
         data_dir=tmp_path,
         timezone=TZ,
-        model="claude-opus-5-5",
+        ai_backend="agy",
+        model=None,
+        agy_bin="agy",
+        agy_workdir=tmp_path / "agy-workspace",
+        agy_timeout_min=1,
+        agy_sandbox=True,
+        update_hours=12,
         digest_time="09:00",
         scan_interval_min=10,
         groups_mode="mentions",
@@ -197,3 +203,113 @@ def test_digest_window(bot_app, monkeypatch):
         monkeypatch.setattr(app_module, "local_hm", lambda tz, m=moment: m[11:16])
         asyncio.run(bot_app.check_digest())
         assert len(sent) == expected, moment
+
+
+class FakeModelsAI:
+    backend = "agy"
+    backend_title = "agy"
+
+    def __init__(self):
+        self.model = None
+        self.models = [ModelInfo("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)")]
+        self.versions = ["1.1.27", "1.1.27"]
+        self.updated = 0
+
+    async def version(self):
+        return self.versions.pop(0) if len(self.versions) > 1 else self.versions[0]
+
+    async def update(self):
+        self.updated += 1
+
+    async def list_models(self):
+        return list(self.models)
+
+
+def test_resolve_model():
+    models = [
+        ModelInfo("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"),
+        ModelInfo("gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)"),
+        ModelInfo("gemini-3.1-pro-high", "Gemini 3.1 Pro (High)"),
+    ]
+    assert resolve_model(models, "gemini-3.1-pro-high")[0].id == "gemini-3.1-pro-high"
+    assert resolve_model(models, "Gemini 3.8 Flash (Low)")[0].id == "gemini-3.8-flash-low"
+    assert resolve_model(models, "gemini pro")[0].id == "gemini-3.1-pro-high"
+    match, candidates = resolve_model(models, "flash")
+    assert match is None and len(candidates) == 2
+
+
+def test_model_choice_from_button_and_tool(bot_app):
+    bot_app.ai = FakeModelsAI()
+    bot_app.ai.models.append(ModelInfo("gemini-3.1-pro-high", "Gemini 3.1 Pro (High)"))
+
+    text, buttons = asyncio.run(bot_app.model_picker())
+    assert "Сейчас: <b>По умолчанию agy</b>" in text
+    assert data(buttons[1][0]) == b"m:id:gemini-3.1-pro-high"
+
+    event = FakeEvent(b"m:id:gemini-3.1-pro-high")
+    asyncio.run(bot_app.on_callback(event))
+    assert bot_app.ai.model == "gemini-3.1-pro-high"
+    assert bot_app.storage.get("model:agy") == "gemini-3.1-pro-high"
+    assert "Gemini 3.1 Pro (High)" in event.edits[0][0]
+
+    out = asyncio.run(bot_app.execute_tool("update_settings", {"timezone": None, "digest_time": None, "model": "flash"}))
+    assert out == "Сохранено: модель Gemini 3.8 Flash (High)"
+    assert bot_app.ai.model == "gemini-3.8-flash-high"
+    assert "Ошибка" in asyncio.run(
+        bot_app.execute_tool("update_settings", {"timezone": None, "digest_time": None, "model": "gpt-9"})
+    )
+
+    asyncio.run(bot_app.on_callback(FakeEvent(b"m:default:0")))
+    assert bot_app.ai.model is None and bot_app.chosen_model() is None
+
+
+def test_model_persists_between_restarts(tmp_path):
+    first = App(make_settings(tmp_path))
+    first.set_model("gemini-3.1-pro-high")
+    first.storage.close()
+    second = App(make_settings(tmp_path))
+    assert second.ai.model == "gemini-3.1-pro-high"
+    second.storage.close()
+
+
+def test_check_updates_notifies_about_new_models(bot_app):
+    ai = FakeModelsAI()
+    bot_app.ai = ai
+
+    asyncio.run(bot_app.check_updates())  # первый раз только запоминаем список
+    assert bot_app.sent == [] and ai.updated == 1
+
+    ai.models.append(ModelInfo("gemini-4.0-pro-high", "Gemini 4.0 Pro (High)"))
+    ai.versions = ["1.1.27", "1.2.0"]
+    asyncio.run(bot_app.check_updates())
+    text, buttons = bot_app.sent[-1]
+    assert "agy обновился: 1.1.27 → 1.2.0" in text
+    assert "Gemini 4.0 Pro (High)" in text
+    assert data(buttons[0][0]) == b"m:id:gemini-4.0-pro-high"
+
+    bot_app.sent.clear()
+    asyncio.run(bot_app.check_updates())  # ничего нового — молчим
+    assert bot_app.sent == []
+
+    bot_app.set_model("gemini-4.0-pro-high")
+    ai.models.pop()  # выбранная модель исчезла
+    asyncio.run(bot_app.check_updates(manual=True))
+    assert "больше недоступна" in bot_app.sent[-1][0]
+    assert bot_app.chosen_model() is None
+
+    bot_app.sent.clear()
+    asyncio.run(bot_app.check_updates(manual=True))
+    assert "Всё актуально, версия agy 1.2.0" in bot_app.sent[-1][0]
+
+
+def test_long_model_id_uses_index(bot_app):
+    long_id = "vendor/" + "x" * 70 + "-1"
+    bot_app.ai = FakeModelsAI()
+    bot_app.ai.models = [ModelInfo(long_id, "Длинная модель")]
+    text, buttons = asyncio.run(bot_app.model_picker())
+    assert data(buttons[0][0]) == b"m:ix:0"
+    asyncio.run(bot_app.on_callback(FakeEvent(b"m:ix:0")))
+    assert bot_app.chosen_model() == long_id
+    stale = FakeEvent(b"m:ix:5")
+    asyncio.run(bot_app.on_callback(stale))
+    assert "устарел" in stale.answers[0]

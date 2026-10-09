@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import os
 import secrets
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -17,7 +19,8 @@ from telethon.errors import RPCError
 from telethon.tl import functions, types
 
 from . import userbot
-from .ai import AI, AIError
+from .agy import AgyAI, AgyRunner, find_agy, risky_permission_mode
+from .ai import AI, AIError, ClaudeAI, ModelInfo
 from .config import ConfigError, Settings, parse_digest_time, validate_timezone
 from .folders import (
     ResolvedPlan,
@@ -43,11 +46,13 @@ log = logging.getLogger(__name__)
 BTN_FOLDERS = "📁 Разложить чаты"
 BTN_TASKS = "📝 Задачи"
 BTN_DIGEST = "☀️ Сводка"
+BTN_MODEL = "🧠 Модель"
 BTN_HELP = "❓ Помощь"
 
 MAIN_KEYBOARD = [
     [Button.text(BTN_FOLDERS, resize=True), Button.text(BTN_TASKS, resize=True)],
-    [Button.text(BTN_DIGEST, resize=True), Button.text(BTN_HELP, resize=True)],
+    [Button.text(BTN_DIGEST, resize=True), Button.text(BTN_MODEL, resize=True)],
+    [Button.text(BTN_HELP, resize=True)],
 ]
 
 HELP_TEXT = """\
@@ -58,6 +63,7 @@ HELP_TEXT = """\
 📁 <b>Разложить чаты</b> — предложу папки по смыслу. Ничего не меняю, пока не нажмёшь «Применить».
 📝 <b>Задачи</b> — список дел и напоминаний.
 ☀️ <b>Сводка</b> — что важного в непрочитанном и что на сегодня.
+🧠 <b>Модель</b> — выбрать, какой моделью я думаю. О новых моделях сообщу сам.
 
 Можно писать обычным текстом:
 • <i>напомни завтра в 10 позвонить маме</i>
@@ -65,6 +71,7 @@ HELP_TEXT = """\
 • <i>найди, где Саша скидывал адрес</i>
 • <i>объедини папки учёба и курсы</i>
 • <i>присылай сводку в 8:30</i>
+• <i>переключись на gemini pro</i>
 
 Ещё я сам читаю новые сообщения в личках (и в группах, где тебя упомянули) \
 и предлагаю задачи: «ты обещал скинуть отчёт до пятницы». Сохраняю только то, что ты подтвердишь."""
@@ -74,6 +81,8 @@ DIGEST_LOOP_SEC = 30
 DIGEST_WINDOW_MIN = 60  # если бот был выключен в момент сводки, догоняем в течение часа
 INBOX_BATCH = 300
 MESSAGE_LIMIT = 4000
+MODELS_CACHE_SEC = 600
+FIRST_UPDATE_CHECK_SEC = 60
 
 
 @dataclass
@@ -116,11 +125,44 @@ def minutes(hm: str) -> int:
     return int(h) * 60 + int(m)
 
 
+def make_ai(settings: Settings, model: str | None) -> AI:
+    if settings.ai_backend == "claude":
+        return ClaudeAI(model)
+    runner = AgyRunner(
+        settings.agy_bin, settings.agy_workdir, settings.agy_timeout_min, settings.agy_sandbox
+    )
+    return AgyAI(model, runner)
+
+
+def resolve_model(models: list[ModelInfo], query: str) -> tuple[ModelInfo | None, list[ModelInfo]]:
+    """Ищет модель по id или названию: точное совпадение, потом единственное частичное."""
+    q = " ".join(query.lower().split())
+    for model in models:
+        if q in (model.id.lower(), model.name.lower()):
+            return model, []
+    words = q.replace("-", " ").split()
+    candidates = [
+        m for m in models if all(w in f"{m.id} {m.name}".lower().replace("-", " ") for w in words)
+    ]
+    if len(candidates) == 1:
+        return candidates[0], []
+    return None, candidates
+
+
+def model_button_data(model: ModelInfo, index: int) -> bytes:
+    """Callback-данные кнопки модели: id модели, а если он не влезает в 64 байта — номер в списке."""
+    data = f"m:id:{model.id}".encode()
+    return data if len(data) <= 64 else f"m:ix:{index}".encode()
+
+
 class App:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.storage = Storage(settings.db_path)
-        self.ai = AI(settings.model)
+        stored_model = self.storage.get(f"model:{settings.ai_backend}")
+        self.ai = make_ai(settings, stored_model or settings.model)
+        self.models_cache: list[ModelInfo] = []
+        self.models_cached_at = 0.0
         self.user = TelegramClient(str(settings.user_session), settings.api_id, settings.api_hash)
         self.bot = TelegramClient(str(settings.bot_session), settings.api_id, settings.api_hash)
         self.bot.parse_mode = "html"
@@ -146,8 +188,9 @@ class App:
     # --- запуск ---
 
     async def run(self) -> None:
-        if not (os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN")):
-            log.warning("ANTHROPIC_API_KEY не задан в .env — ИИ-функции работать не будут.")
+        warnings = self.startup_warnings()
+        for warning in warnings:
+            log.warning(warning)
         await self.user.connect()
         if not await self.user.is_user_authorized():
             raise ConfigError("Аккаунт не подключён. Сначала выполни: python -m tgmanager login")
@@ -169,27 +212,51 @@ class App:
         log.info(
             "Запущено: аккаунт %s, бот @%s", utils.get_display_name(me), bot_me.username
         )
+        greeting = "👋 Я на связи. Нажми «❓ Помощь», чтобы узнать, что я умею."
+        if warnings:
+            greeting += "\n\n" + "\n\n".join(f"⚠️ {w}" for w in warnings)
         try:
-            await self.bot.send_message(
-                self.owner_id, "👋 Я на связи. Нажми «❓ Помощь», чтобы узнать, что я умею.",
-                buttons=MAIN_KEYBOARD,
-            )
+            await self.bot.send_message(self.owner_id, html.escape(greeting), buttons=MAIN_KEYBOARD)
         except (RPCError, ValueError):
             log.warning("Открой @%s в Telegram и нажми Start — тогда я смогу тебе писать.", bot_me.username)
 
-        await asyncio.gather(
+        jobs = [
             self.user.disconnected,
             self.bot.disconnected,
             self._loop(self.check_reminders, REMINDER_LOOP_SEC),
             self._loop(self.check_digest, DIGEST_LOOP_SEC),
             self._loop(self.scan_inbox, self.settings.scan_interval_min * 60),
-        )
+        ]
+        if self.settings.update_hours:
+            jobs.append(
+                self._loop(self.check_updates, self.settings.update_hours * 3600, FIRST_UPDATE_CHECK_SEC)
+            )
+        await asyncio.gather(*jobs)
+
+    def startup_warnings(self) -> list[str]:
+        warnings = []
+        if self.ai.backend == "agy":
+            if not find_agy(self.settings.agy_bin):
+                warnings.append(
+                    "Не нашёл agy. Установи Antigravity CLI и войди в аккаунт, иначе ИИ работать не будет."
+                )
+            if risky_permission_mode():
+                warnings.append(
+                    "В настройках agy включено toolPermission: always-proceed — агент выполняет команды "
+                    "без спроса. Раз я передаю ему тексты чужих сообщений, лучше вернуть request-review "
+                    "в ~/.gemini/antigravity-cli/settings.json."
+                )
+        elif not (os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN")):
+            warnings.append("ANTHROPIC_API_KEY не задан в .env — ИИ работать не будет.")
+        return warnings
 
     async def _set_commands(self) -> None:
         commands = [
             types.BotCommand("tasks", "Мои задачи"),
             types.BotCommand("folders", "Разложить чаты по папкам"),
             types.BotCommand("digest", "Сводка непрочитанного"),
+            types.BotCommand("model", "Выбрать модель ИИ"),
+            types.BotCommand("update", "Проверить обновления и новые модели"),
             types.BotCommand("help", "Что я умею"),
         ]
         try:
@@ -202,9 +269,11 @@ class App:
             log.warning("Не удалось установить команды бота: %s", exc)
 
     @staticmethod
-    async def _loop(job: Any, interval: int) -> None:
+    async def _loop(job: Any, interval: int, first_delay: int | None = None) -> None:
+        delay = interval if first_delay is None else first_delay
         while True:
-            await asyncio.sleep(interval)
+            await asyncio.sleep(delay)
+            delay = interval
             try:
                 await job()
             except Exception:
@@ -241,6 +310,11 @@ class App:
                 await self.send_tasks()
             elif command == "/digest" or text == BTN_DIGEST:
                 await self.send_digest()
+            elif command == "/model" or text == BTN_MODEL:
+                await self.send_model_picker()
+            elif command == "/update":
+                await self.send_text("🔄 Проверяю обновления…")
+                await self.check_updates(manual=True)
             elif text:
                 if event.message.fwd_from:
                     text = "Владелец переслал сообщение:\n" + text
@@ -301,7 +375,7 @@ class App:
             )
             return "\n".join(found) if found else "Ничего не найдено."
         if name == "update_settings":
-            return self._update_settings(args)
+            return await self._update_settings(args)
         return f"Неизвестный инструмент {name}."
 
     def _parse_due(self, value: Any) -> int | None:
@@ -335,8 +409,17 @@ class App:
             return f"Задача #{task.id} переименована."
         return "Ошибка: неизвестное действие."
 
-    def _update_settings(self, args: dict[str, Any]) -> str:
+    async def _update_settings(self, args: dict[str, Any]) -> str:
         done = []
+        if args.get("model"):
+            models = await self.get_models()
+            found, candidates = resolve_model(models, str(args["model"]))
+            if found is None:
+                options = candidates or models
+                names = ", ".join(f"{m.name} ({m.id})" for m in options[:15])
+                return f"Ошибка: не понял, какую модель выбрать. Варианты: {names}"
+            self.set_model(found.id)
+            done.append(f"модель {found.name}")
         try:
             if args.get("timezone"):
                 tz = validate_timezone(str(args["timezone"]).strip())
@@ -584,6 +667,130 @@ class App:
             text += "\n\n⚠️ Не всё получилось:\n" + "\n".join(errors[:10])
         await event.edit(html.escape(text), buttons=None)
 
+    # --- модели и обновления ---
+
+    def _model_key(self) -> str:
+        return f"model:{self.ai.backend}"
+
+    def chosen_model(self) -> str | None:
+        """Модель, выбранная в чате (None — по умолчанию)."""
+        return self.storage.get(self._model_key()) or None
+
+    def set_model(self, model_id: str | None) -> None:
+        self.storage.set(self._model_key(), model_id or "")
+        self.ai.model = model_id or self.settings.model
+
+    async def get_models(self, refresh: bool = False) -> list[ModelInfo]:
+        fresh = time.monotonic() - self.models_cached_at < MODELS_CACHE_SEC
+        if refresh or not self.models_cache or not fresh:
+            self.models_cache = await self.ai.list_models()
+            self.models_cached_at = time.monotonic()
+        return self.models_cache
+
+    def model_title(self, model_id: str | None) -> str:
+        if not model_id:
+            return "по умолчанию"
+        for model in self.models_cache:
+            if model.id == model_id:
+                return model.name
+        return model_id
+
+    async def model_picker(self, refresh: bool = False) -> tuple[str, Any]:
+        models = await self.get_models(refresh)
+        chosen = self.chosen_model()
+        default = self.settings.model
+        if self.ai.backend == "agy":
+            default_label = f"По умолчанию ({self.model_title(default)})" if default else "По умолчанию agy"
+        else:
+            default_label = f"По умолчанию ({self.model_title(default or self.ai.model)})"
+        lines = [
+            f"🧠 <b>Модель ИИ</b> — {html.escape(self.ai.backend_title)}",
+            f"Сейчас: <b>{html.escape(self.model_title(chosen) if chosen else default_label)}</b>",
+            "",
+            "Выбери модель. Лимиты у каждой модели свои: если одна упрётся в лимит, переключись на другую.",
+        ]
+        buttons = [
+            [Button.inline(("✅ " if m.id == chosen else "") + m.name[:56], model_button_data(m, i))]
+            for i, m in enumerate(models[:40])
+        ]
+        buttons.append(
+            [
+                Button.inline(("✅ " if not chosen else "") + default_label[:40], b"m:default:0"),
+                Button.inline("🔄 Обновить список", b"m:refresh:0"),
+            ]
+        )
+        return "\n".join(lines), buttons
+
+    async def send_model_picker(self) -> None:
+        async with self.bot.action(self.owner_id, "typing"):
+            text, buttons = await self.model_picker()
+        await self.send_html(text, buttons=buttons)
+
+    async def _model_button(self, event: Any, action: str, value: str) -> None:
+        if action == "ix":
+            index = int(value) if value.isdigit() else -1
+            if not 0 <= index < len(self.models_cache):
+                await event.answer("Список устарел, открой «🧠 Модель» заново.", alert=True)
+                return
+            action, value = "id", self.models_cache[index].id
+        if action == "id":
+            self.set_model(value)
+            name = self.model_title(value)
+            await event.answer(f"Модель: {name}")
+            await event.edit(f"🧠 Теперь думаю моделью <b>{html.escape(name)}</b>.", buttons=None)
+        elif action == "default":
+            self.set_model(None)
+            await event.answer("Модель по умолчанию")
+            await event.edit("🧠 Вернул модель по умолчанию.", buttons=None)
+        elif action == "refresh":
+            await event.answer("Обновляю список…")
+            text, buttons = await self.model_picker(refresh=True)
+            await event.edit(text, buttons=buttons)
+
+    async def check_updates(self, manual: bool = False) -> None:
+        """Обновляет agy и сравнивает список моделей с прошлым. О новых моделях пишет сам."""
+        ai = self.ai
+        before = await ai.version()
+        update_error = None
+        try:
+            await ai.update()
+        except AIError as exc:
+            update_error = str(exc)
+            log.warning("Не удалось обновить %s: %s", ai.backend_title, exc)
+        after = await ai.version() if ai.backend == "agy" else before
+        models = await self.get_models(refresh=True)
+        ids = [m.id for m in models]
+
+        key = f"known_models:{ai.backend}"
+        known_raw = self.storage.get(key)
+        self.storage.set(key, json.dumps(ids))
+        known = set(json.loads(known_raw)) if known_raw else None
+        new = [m for m in models if known is not None and m.id not in known]
+
+        lines: list[str] = []
+        if before and after and before != after:
+            lines.append(f"🔄 agy обновился: {before} → {after}")
+        if new:
+            lines.append("🆕 <b>Появились новые модели:</b>")
+            lines += [f"• {html.escape(m.name)} <code>{html.escape(m.id)}</code>" for m in new]
+            lines.append("Нажми, чтобы переключиться:")
+        chosen = self.chosen_model()
+        if chosen and chosen not in ids:
+            self.set_model(None)
+            lines.append(f"⚠️ Модель {html.escape(chosen)} больше недоступна — вернул модель по умолчанию.")
+
+        if manual:
+            if not lines:
+                version = f", версия agy {after}" if after else ""
+                lines.append(f"✅ Всё актуально{version}. Моделей доступно: {len(models)}.")
+            if update_error:
+                lines.append(f"⚠️ Обновить не получилось: {html.escape(update_error)}")
+        if lines:
+            buttons = [
+                [Button.inline(m.name[:60], model_button_data(m, models.index(m)))] for m in new[:10]
+            ]
+            await self.send_html("\n".join(lines), buttons=buttons or None)
+
     # --- кнопки ---
 
     async def on_callback(self, event: events.CallbackQuery.Event) -> None:
@@ -599,6 +806,8 @@ class App:
                     if self.pending_plan and self.pending_plan.id == ident:
                         self.pending_plan = None
                     await event.edit("Отменено. Папки не менял.", buttons=None)
+            elif kind == "m":
+                await self._model_button(event, action, ident)
             elif kind in ("t", "s") and ident.isdigit():
                 await self._task_button(event, kind, action, int(ident))
             else:

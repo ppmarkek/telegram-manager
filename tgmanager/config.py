@@ -9,9 +9,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
-DEFAULT_MODEL = "claude-opus-5-5"
-
-
 class ConfigError(Exception):
     pass
 
@@ -23,7 +20,13 @@ class Settings:
     bot_token: str
     data_dir: Path
     timezone: str
-    model: str
+    ai_backend: str  # agy | claude
+    model: str | None  # модель по умолчанию; из чата можно выбрать другую
+    agy_bin: str
+    agy_workdir: Path
+    agy_timeout_min: int
+    agy_sandbox: bool
+    update_hours: int  # как часто обновлять agy и проверять новые модели; 0 — никогда
     digest_time: str | None  # "09:00" или None — без утренней сводки
     scan_interval_min: int
     groups_mode: str  # mentions | all | off
@@ -101,8 +104,20 @@ def parse_excluded(raw: str) -> frozenset[str]:
     return frozenset(item for item in items if item)
 
 
-def load_settings(require_bot: bool = True) -> Settings:
+def _bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on", "да")
+
+
+def load_settings(require_telegram: bool = True, require_bot: bool = True) -> Settings:
     load_dotenv()
+
+    ai_backend = os.getenv("AI_BACKEND", "agy").strip().lower()
+    if ai_backend not in ("agy", "claude"):
+        raise ConfigError("AI_BACKEND должен быть agy или claude")
+    model_var = "AGY_MODEL" if ai_backend == "agy" else "CLAUDE_MODEL"
 
     groups_mode = os.getenv("GROUPS_MODE", "mentions").strip().lower()
     if groups_mode not in ("mentions", "all", "off"):
@@ -112,12 +127,21 @@ def load_settings(require_bot: bool = True) -> Settings:
     data_dir.mkdir(parents=True, exist_ok=True)
 
     return Settings(
-        api_id=_required_int("TG_API_ID"),
-        api_hash=_required("TG_API_HASH"),
+        api_id=_required_int("TG_API_ID") if require_telegram else _int("TG_API_ID", 0),
+        api_hash=_required("TG_API_HASH") if require_telegram else os.getenv("TG_API_HASH", ""),
         bot_token=_required("BOT_TOKEN") if require_bot else os.getenv("BOT_TOKEN", ""),
         data_dir=data_dir,
         timezone=validate_timezone(os.getenv("TIMEZONE", "Europe/Moscow").strip()),
-        model=os.getenv("CLAUDE_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL,
+        ai_backend=ai_backend,
+        model=os.getenv(model_var, "").strip() or None,
+        agy_bin=os.getenv("AGY_BIN", "agy").strip() or "agy",
+        # Пустая папка вне проекта: агенту agy в ней нечего читать (ни .env, ни сессий).
+        agy_workdir=Path(
+            os.getenv("AGY_WORKDIR", "").strip() or Path.home() / ".tgmanager" / "agy-workspace"
+        ).expanduser(),
+        agy_timeout_min=max(1, _int("AGY_TIMEOUT_MIN", 10)),
+        agy_sandbox=_bool("AGY_SANDBOX", True),
+        update_hours=max(0, _int("AUTO_UPDATE_HOURS", 12)),
         digest_time=parse_digest_time(os.getenv("DIGEST_TIME", "09:00")),
         scan_interval_min=max(1, _int("SCAN_INTERVAL_MIN", 10)),
         groups_mode=groups_mode,
